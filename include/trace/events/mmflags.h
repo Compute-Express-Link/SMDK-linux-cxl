@@ -13,6 +13,12 @@
  * Thus most bits set go first.
  */
 
+#ifdef CONFIG_EXMEM
+# define IF_HAVE_GFP_EXMEM(flag, name) ,{(unsigned long)flag, name}
+#else
+# define IF_HAVE_GFP_EXMEM(flag, name)
+#endif
+
 #define __def_gfpflag_names						\
 	{(unsigned long)GFP_TRANSHUGE,		"GFP_TRANSHUGE"},	\
 	{(unsigned long)GFP_TRANSHUGE_LIGHT,	"GFP_TRANSHUGE_LIGHT"}, \
@@ -50,6 +56,7 @@
 	{(unsigned long)__GFP_DIRECT_RECLAIM,	"__GFP_DIRECT_RECLAIM"},\
 	{(unsigned long)__GFP_KSWAPD_RECLAIM,	"__GFP_KSWAPD_RECLAIM"},\
 	{(unsigned long)__GFP_ZEROTAGS,		"__GFP_ZEROTAGS"}	\
+IF_HAVE_GFP_EXMEM(__GFP_EXMEM,                  "__GFP_EXMEM")  \
 
 #ifdef CONFIG_KASAN_HW_TAGS
 #define __def_gfpflag_names_kasan ,					       \
@@ -160,6 +167,12 @@ IF_HAVE_PG_SKIP_KASAN_POISON(PG_skip_kasan_poison, "skip_kasan_poison")
 # define IF_HAVE_UFFD_MINOR(flag, name)
 #endif
 
+#ifdef CONFIG_EXMEM
+#define IF_HAVE_VM_EXMEM(flag,name) ,{flag, name }
+#else
+#define IF_HAVE_VM_EXMEM(flag,name)
+#endif
+
 #define __def_vmaflag_names						\
 	{VM_READ,			"read"		},		\
 	{VM_WRITE,			"write"		},		\
@@ -193,6 +206,7 @@ IF_HAVE_VM_SOFTDIRTY(VM_SOFTDIRTY,	"softdirty"	)		\
 	{VM_HUGEPAGE,			"hugepage"	},		\
 	{VM_NOHUGEPAGE,			"nohugepage"	},		\
 	{VM_MERGEABLE,			"mergeable"	}		\
+IF_HAVE_VM_EXMEM(VM_EXMEM,	"exmem" )				\
 
 #define show_vma_flags(flags)						\
 	(flags) ? __print_flags(flags, "|",				\
