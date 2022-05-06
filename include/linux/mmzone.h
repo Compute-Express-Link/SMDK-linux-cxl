@@ -658,15 +658,15 @@ struct zone {
 	struct free_area	free_area[MAX_ORDER];
 
 #ifdef CONFIG_EXMEM
-	struct free_area	free_area_subzone[MAX_NR_SUBZONES][MAX_ORDER];
-	struct subzone		subzones[MAX_NR_SUBZONES];
+	struct free_area	*free_area_subzone[MAX_NR_SUBZONES];
+	struct subzone		*subzones;
 	nodemask_t			subzone_mask; // FIXME
 
 	/*
 	 * subzonelist contains references to all subzones in ExMem zone.
 	 * subzonelist SHOULD BE NULL-terminated.
 	 */
-	struct subzoneref	subzonelist[MAX_NR_SUBZONES + 1];
+	struct subzoneref	*subzonelist;
 	unsigned int		nr_subzones;
 
 	unsigned int		cur_subzone_idx;

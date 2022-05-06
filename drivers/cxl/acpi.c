@@ -275,6 +275,31 @@ static int add_root_nvdimm_bridge(struct device *match, void *data)
 	return 1;
 }
 
+#ifdef CONFIG_EXMEM
+static int add_cxl_info_cfmws(struct device *match, void *data)
+{
+	struct cxl_decoder *cxld;
+	int rc;
+
+	if (!is_root_decoder(match))
+		return 0;
+
+	cxld = to_cxl_decoder(match);
+	if (!(cxld->flags & CXL_DECODER_F_RAM))
+		return 0;
+
+	pr_info("CXL: %s node: %d range %pr\n", dev_name(&cxld->dev),
+			phys_to_target_node(cxld->platform_res.start),
+			&cxld->platform_res);
+
+	rc = register_cxl_cfmws_ranges(cxld);
+	if (rc)
+		return rc;
+
+	return 0;
+}
+#endif
+
 static int cxl_acpi_probe(struct platform_device *pdev)
 {
 	int rc;
@@ -313,6 +338,15 @@ static int cxl_acpi_probe(struct platform_device *pdev)
 					   add_root_nvdimm_bridge);
 	if (rc < 0)
 		return rc;
+
+#ifdef CONFIG_EXMEM
+	rc = device_for_each_child(&root_port->dev, root_port,
+			add_cxl_info_cfmws);
+	if (rc < 0) {
+		pr_err("CXL: Failed to add cxl info with cedt.cfmws\n");
+		return rc;
+	}
+#endif
 
 	/* In case PCI is scanned before ACPI re-trigger memdev attach */
 	return cxl_bus_rescan();

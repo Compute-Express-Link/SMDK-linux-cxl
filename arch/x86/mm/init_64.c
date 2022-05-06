@@ -1495,6 +1495,7 @@ static unsigned long probe_memory_block_size(void)
 		goto done;
 	}
 
+#ifndef CONFIG_EXMEM
 	/*
 	 * Use max block size to minimize overhead on bare metal, where
 	 * alignment for memory hotplug isn't a concern.
@@ -1503,6 +1504,7 @@ static unsigned long probe_memory_block_size(void)
 		bz = MAX_BLOCK_SIZE;
 		goto done;
 	}
+#endif
 
 	/* Find the largest allowed block size that aligns to memory end */
 	for (bz = MAX_BLOCK_SIZE; bz > MIN_MEMORY_BLOCK_SIZE; bz >>= 1) {

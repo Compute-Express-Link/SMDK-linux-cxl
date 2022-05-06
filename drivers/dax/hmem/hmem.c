@@ -5,7 +5,11 @@
 #include <linux/pfn_t.h>
 #include "../bus.h"
 
+#ifdef CONFIG_EXMEM
+static bool region_idle = true;
+#else
 static bool region_idle;
+#endif
 module_param_named(region_idle, region_idle, bool, 0644);
 
 static int dax_hmem_probe(struct platform_device *pdev)

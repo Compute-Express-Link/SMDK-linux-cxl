@@ -56,7 +56,7 @@
 	{(unsigned long)__GFP_DIRECT_RECLAIM,	"__GFP_DIRECT_RECLAIM"},\
 	{(unsigned long)__GFP_KSWAPD_RECLAIM,	"__GFP_KSWAPD_RECLAIM"},\
 	{(unsigned long)__GFP_ZEROTAGS,		"__GFP_ZEROTAGS"}	\
-IF_HAVE_GFP_EXMEM(__GFP_EXMEM,                  "__GFP_EXMEM")  \
+IF_HAVE_GFP_EXMEM(__GFP_EXMEM,			"__GFP_EXMEM")	\
 
 #ifdef CONFIG_KASAN_HW_TAGS
 #define __def_gfpflag_names_kasan ,					       \

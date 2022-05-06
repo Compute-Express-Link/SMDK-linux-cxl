@@ -43,6 +43,20 @@ static inline int phys_to_target_node(u64 start)
 	return 0;
 }
 #endif
+#ifdef CONFIG_EXMEM
+#ifndef numa_get_reserved_meminfo_cnt
+static inline int numa_get_reserved_meminfo_cnt(void)
+{
+	return 0;
+}
+#endif
+#ifndef numa_get_reserved_meminfo
+static inline int numa_get_reserved_meminfo(int idx, int *nid, u64 *start, u64 *end)
+{
+	return -1;
+}
+#endif
+#endif /* CONFIG_EXMEM */
 #else /* !CONFIG_NUMA */
 static inline int numa_map_to_online_node(int node)
 {
@@ -56,6 +70,16 @@ static inline int phys_to_target_node(u64 start)
 {
 	return 0;
 }
+#ifdef CONFIG_EXMEM
+static inline int numa_get_reserved_meminfo_cnt(void)
+{
+	return 0;
+}
+static inline int numa_get_reserved_meminfo(int idx, int *nid, u64 *start, u64 *end)
+{
+	return -1;
+}
+#endif /* CONFIG_EXMEM */
 #endif
 
 #ifdef CONFIG_HAVE_ARCH_NODE_DEV_GROUP

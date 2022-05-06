@@ -13,59 +13,237 @@
 #include "cxlpci.h"
 #include "cxl.h"
 #ifdef CONFIG_EXMEM
-#include <linux/kobject.h>
-#include <linux/string.h>
-#include <linux/sysfs.h>
-#include <linux/init.h>
-#include <linux/kernel.h>
-#include <asm/numa.h>
+#include <linux/numa.h>
 
-struct numa_memblk {
+enum CXL_MEM_MODE {
+	CXL_MEM_MODE_SOFT_RESERVED = 0,
+	CXL_MEM_MODE_ZONE_NORMAL,
+	CXL_MEM_MODE_ZONE_EXMEM,
+	CXL_MEM_MODE_MAX = CXL_MEM_MODE_ZONE_EXMEM,
+};
+
+enum CXL_GROUP_POLICY {
+	CXL_GROUP_POLICY_ZONE = 0,
+	CXL_GROUP_POLICY_NODE,
+	CXL_GROUP_POLICY_NOOP,
+	CXL_GROUP_POLICY_MAX = CXL_GROUP_POLICY_NOOP
+};
+
+static enum CXL_MEM_MODE cxl_mem_mode = CXL_MEM_MODE_SOFT_RESERVED;
+static enum CXL_GROUP_POLICY cxl_group_policy = CXL_GROUP_POLICY_ZONE;
+
+struct cxl_memblk {
 	u64 start;
 	u64 end;
+	int dev_numa_node;
 	int nid;
+	struct resource *res;
 };
 
-struct numa_meminfo {
+struct cxl_meminfo {
 	int nr_blks;
-	struct numa_memblk blk[NR_NODE_MEMBLKS];
+	int dev_numa_node_to_nid_map[MAX_NUMNODES];
+	struct cxl_memblk blk[MAX_NUMNODES];
 };
 
-static struct numa_meminfo cxl_meminfo;
+static bool dvsec_only_device = false;
+static struct cxl_meminfo cxl_meminfo;
+static DEFINE_MUTEX(cxl_meminfo_lock);
 
-extern void numa_get_reserved_meminfo(struct numa_meminfo *mi);
+/* Memory resource name used for add_memory_driver_managed(). */
+static const char *smdk_res_name = "System RAM (cxl)";
 
-static void print_numa_reserved_meminfo(struct numa_meminfo *mi)
+static int __get_cxl_nid(enum CXL_GROUP_POLICY policy, struct cxl_memblk *cmb)
+{
+	int nid;
+
+	if (!cmb)
+		return NUMA_NO_NODE;
+
+	switch (policy) {
+	case CXL_GROUP_POLICY_ZONE:
+		return cmb->dev_numa_node;
+	case CXL_GROUP_POLICY_NODE:
+		nid = cxl_meminfo.dev_numa_node_to_nid_map[cmb->dev_numa_node];
+		if (nid != NUMA_NO_NODE)
+			return nid;
+
+		for (nid = 0; nid < MAX_NUMNODES; nid++) {
+			if (node_online(nid))
+				continue;
+
+			cxl_meminfo.dev_numa_node_to_nid_map[cmb->dev_numa_node] = nid;
+			return nid;
+		}
+
+		return NUMA_NO_NODE;
+	case CXL_GROUP_POLICY_NOOP:
+		nid = phys_to_target_node(cmb->start);
+		return nid == NUMA_NO_NODE ? 0 : nid;
+	}
+
+	return NUMA_NO_NODE;
+}
+
+/**
+ * __add_cxl_memory - Add cxl.mem range to system memory
+ * @cmb: information descriptor for cxl memory block
+ * @mode: cxl_mem_mode
+ */
+static int __add_cxl_memory(struct cxl_memblk *cmb, enum CXL_MEM_MODE mode)
+{
+	int rc = 0;
+	int mhp_value = MHP_MERGE_RESOURCE;
+	struct resource *res;
+	u64 size;
+
+	if (!cmb) {
+		pr_err("CXL: cxl memblock is null\n");
+		return -EINVAL;
+	}
+
+	if (cmb->start == 0 || cmb->end == 0) {
+		pr_err("CXL: no cxl.mem range is specified\n");
+		return -EINVAL;
+	}
+
+	if (mode != CXL_MEM_MODE_ZONE_EXMEM && mode != CXL_MEM_MODE_ZONE_NORMAL)
+		return -EINVAL;
+
+	pr_info("CXL: request mem region: [mem %#010llx-%#010llx]\n", cmb->start,
+			cmb->end);
+
+	size = cmb->end - cmb->start + 1;
+	res = request_mem_region(cmb->start, size, "cxl");
+	if (!res) {
+		pr_err("CXL: failed to request mem region\n");
+		return -EBUSY;
+	}
+
+	res->flags = IORESOURCE_SYSTEM_RAM;
+	cmb->res = res;
+
+	pr_info("CXL: add subzone: nid: %d [mem %#010llx-%#010llx]\n", cmb->nid,
+			cmb->start, cmb->end);
+
+	rc = add_subzone(cmb->nid, cmb->start, cmb->end);
+	if (rc) {
+		pr_err("CXL: failed to add subzone\n");
+		goto err_add_subzone;
+	}
+
+	pr_info("CXL: add [mem %#010llx-%#010llx] as %s zone\n", cmb->start,
+			cmb->end, mode == CXL_MEM_MODE_ZONE_EXMEM ? "ExMem" : "Normal");
+
+	if (mode == CXL_MEM_MODE_ZONE_EXMEM)
+		mhp_value |= MHP_EXMEM;
+
+	rc = add_memory_driver_managed(cmb->nid, cmb->start, size, smdk_res_name,
+			mhp_value);
+	if (rc) {
+		pr_err("CXL: failed to add memory with %d\n", rc);
+		goto err_add_memory;
+	}
+
+	return 0;
+
+err_add_memory:
+	if (remove_subzone(cmb->nid, cmb->start, cmb->end))
+		pr_err("CXL: failed to remove subzone\n");
+
+err_add_subzone:
+	release_resource(res);
+	kfree(res);
+	cmb->res = NULL;
+	return rc;
+}
+
+/**
+ * __remove_cxl_memory - Remove cxl.mem range from system memory
+ * @cmb: information descriptor for cxl memory block
+ */
+static int __remove_cxl_memory(struct cxl_memblk *cmb)
+{
+	int rc;
+	u64 size;
+
+	if (!cmb) {
+		pr_err("CXL: cxl memblock is null\n");
+		return -EINVAL;
+	}
+
+	if (cmb->start == 0 || cmb->end == 0) {
+		pr_err("CXL: no cxl.mem range is specified\n");
+		return -EINVAL;
+	}
+
+	pr_info("CXL: remove [mem %#010llx-%#010llx]\n", cmb->start, cmb->end);
+
+	size = cmb->end - cmb->start + 1;
+	rc = offline_and_remove_memory(cmb->start, size);
+	if (rc) {
+		pr_err("CXL: failed to offline and remove memory\n");
+		return rc;
+	}
+
+	pr_info("CXL: remove subzone: nid: %d [mem %#010llx-%#010llx]\n",
+			cmb->nid, cmb->start, cmb->end);
+
+	rc = remove_subzone(cmb->nid, cmb->start, cmb->end);
+	if (rc) {
+		pr_err("CXL: failed to remove subzone\n");
+		return rc;
+	}
+
+	pr_info("CXL: release resource %pr\n", cmb->res);
+
+	release_resource(cmb->res);
+	kfree(cmb->res);
+	cmb->res = NULL;
+
+	return rc;
+}
+
+static void print_cxl_meminfo(void)
+{
+	int i, cnt = 0;
+
+	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
+		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
+			continue;
+
+		pr_info("CXL: nid: %d, dev nid: %d, [mem %#010llx-%#010llx]\n",
+				cxl_meminfo.blk[i].nid, cxl_meminfo.blk[i].dev_numa_node,
+				cxl_meminfo.blk[i].start, cxl_meminfo.blk[i].end);
+
+		cnt++;
+	}
+
+	pr_info("CXL: node count: %d\n", cnt);
+}
+
+static struct cxl_memblk *find_cxl_meminfo(u64 start, u64 end)
 {
 	int i;
 
-	pr_info("CXL: node count: %d\n", mi->nr_blks);
-
-	for (i = 0; i < mi->nr_blks; i++) {
-		if (mi->blk[i].nid == NUMA_NO_NODE)
-			continue;
-
-		pr_info("CXL: nid: %d, [mem %#010llx-%#010llx]\n",
-				mi->blk[i].nid, mi->blk[i].start, mi->blk[i].end);
+	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
+		if (cxl_meminfo.blk[i].start == start && cxl_meminfo.blk[i].end == end)
+			return &cxl_meminfo.blk[i];
 	}
-}
 
+	return NULL;
+}
 
 static int __check_cxl_range(struct resource *res, void *data)
 {
 	int i = 0;
-
-	if (res->parent != &iomem_resource) {
-		pr_info("CXL: skip %pr, already claimed\n", res);
-		return 0;
-	}
 
 	pr_info("CXL: soft reserved: [mem %#010llx-%#010llx]\n",
 			res->start, res->end);
 
 	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
 		if (res->start <= cxl_meminfo.blk[i].start &&
-				cxl_meminfo.blk[i].end <= res->end + 1)
+				cxl_meminfo.blk[i].end <= res->end)
 			continue;
 
 		pr_info("CXL: out of range: [mem %#010llx-%#010llx]\n",
@@ -77,12 +255,356 @@ static int __check_cxl_range(struct resource *res, void *data)
 	return 0;
 }
 
-static void check_reserved_meminfo(struct numa_meminfo *mi)
+static void check_reserved_meminfo(void)
 {
+	mutex_lock(&cxl_meminfo_lock);
 	walk_iomem_res_desc(IORES_DESC_SOFT_RESERVED,
 			IORESOURCE_MEM, 0, -1, NULL, __check_cxl_range);
+	mutex_unlock(&cxl_meminfo_lock);
 }
-#endif
+
+static struct cxl_memblk *add_cxl_meminfo(u64 start, u64 size,
+		int dev_numa_node, int nid)
+{
+	struct cxl_memblk *cmb = NULL;
+
+	if (nid < 0 || cxl_meminfo.nr_blks >= MAX_NUMNODES)
+		return NULL;
+
+	cmb = &cxl_meminfo.blk[cxl_meminfo.nr_blks++];
+	cmb->start = start;
+	cmb->end = start + size - 1;
+	if (dev_numa_node == NUMA_NO_NODE)
+		cmb->dev_numa_node = 0;
+	else
+		cmb->dev_numa_node = dev_numa_node;
+	cmb->nid = nid;
+
+	pr_info("CXL: add meminfo: nid: %d, [mem %#010llx-%#010llx]\n",
+			nid, cmb->start, cmb->end);
+
+	return cmb;
+}
+
+static int get_cxl_meminfo(void)
+{
+	int nr_blks = numa_get_reserved_meminfo_cnt();
+	int nid;
+	u64 start, end;
+	int rc, i;
+	struct cxl_memblk *cmb;
+
+	for (i = 0; i < MAX_NUMNODES; i++)
+		cxl_meminfo.dev_numa_node_to_nid_map[i] = NUMA_NO_NODE;
+
+	for (i = 0; i < nr_blks; i++) {
+		rc = numa_get_reserved_meminfo(i, &nid, &start, &end);
+		if (rc) {
+			pr_err("CXL: Failed to get cxl meminfo: (%d)\n", rc);
+			return -1;
+		}
+
+		mutex_lock(&cxl_meminfo_lock);
+		cmb = find_cxl_meminfo(start, end);
+		if (cmb) {
+			pr_warn("CXL: same info, [mem %#010llx-%#010llx]\n", start, end);
+			mutex_unlock(&cxl_meminfo_lock);
+			continue;
+		}
+
+		if (!add_cxl_meminfo(start, end - start, NUMA_NO_NODE, nid)) {
+			pr_err("CXL: failed to add cxl meminfo\n");
+			mutex_unlock(&cxl_meminfo_lock);
+			return -1;
+		}
+
+		mutex_unlock(&cxl_meminfo_lock);
+	}
+
+	check_reserved_meminfo();
+	print_cxl_meminfo();
+
+	return 0;
+}
+
+static int update_or_add_cxl_meminfo(u64 start, u64 end, int dev_numa_node)
+{
+	int nid;
+	int rc = 0;
+	struct cxl_memblk *cmb;
+	u64 size = end - start + 1;
+
+	if (start == 0 || end == 0 || size == 0)
+		return -EINVAL;
+
+	mutex_lock(&cxl_meminfo_lock);
+
+	cmb = find_cxl_meminfo(start, end);
+	if (cmb) {
+		if (dev_numa_node != NUMA_NO_NODE) {
+			pr_info("CXL: update dev_numa_node to %d [mem %#010llx-%#010llx]\n",
+					dev_numa_node, cmb->start, cmb->end);
+			cmb->dev_numa_node = dev_numa_node;
+
+			if (cxl_mem_mode == CXL_MEM_MODE_ZONE_EXMEM) {
+				nid = __get_cxl_nid(cxl_group_policy, cmb);
+				if (nid != NUMA_NO_NODE && cmb->nid != nid) {
+					rc = __remove_cxl_memory(cmb);
+					if (rc)
+						goto out;
+
+					cmb->nid = nid;
+					rc = __add_cxl_memory(cmb, cxl_mem_mode);
+					if (rc)
+						goto out;
+				}
+			}
+		}
+		mutex_unlock(&cxl_meminfo_lock);
+		return 0;
+	}
+
+	nid = phys_to_target_node(start);
+	if (nid == NUMA_NO_NODE) {
+		pr_warn("CXL: Warning: there's no node info. set nid 0.\n");
+		nid = 0;
+	}
+
+	cmb = add_cxl_meminfo(start, size, dev_numa_node, nid);
+	if (!cmb) {
+		mutex_unlock(&cxl_meminfo_lock);
+		pr_err("CXL: Failed to add cxl meminfo\n");
+		return -1;
+	}
+
+	nid = __get_cxl_nid(cxl_group_policy, cmb);
+	if (nid == NUMA_NO_NODE) {
+		mutex_unlock(&cxl_meminfo_lock);
+		pr_err("CXL: no node information found [mem %#010llx-%#010llx]\n",
+				start, end);
+		return -1;
+	}
+
+	cmb->nid = nid;
+
+	if (cxl_mem_mode != CXL_MEM_MODE_SOFT_RESERVED) {
+		rc = __add_cxl_memory(cmb, cxl_mem_mode);
+		if (rc)
+			goto out;
+	}
+
+out:
+	mutex_unlock(&cxl_meminfo_lock);
+	return rc;
+}
+
+static int register_cxl_dvsec_ranges(struct cxl_dev_state *cxlds)
+{
+	struct cxl_endpoint_dvsec_info *info = &cxlds->info;
+	struct pci_dev *pdev = to_pci_dev(cxlds->dev);
+	struct device *dev = &pdev->dev;
+	int i, rc;
+
+	pr_info("CXL: register cxl dvsec ranges\n");
+
+	for (i = 0; i < info->ranges; i++) {
+		if (info->dvsec_range[i].start == 0 ||
+				info->dvsec_range[i].end == 0)
+			continue;
+
+		if (phys_to_target_node(info->dvsec_range[i].start) == NUMA_NO_NODE)
+			dvsec_only_device = true;
+
+		rc = update_or_add_cxl_meminfo(info->dvsec_range[i].start,
+				info->dvsec_range[i].end, dev->numa_node);
+		if (!rc)
+			return rc;
+	}
+
+	print_cxl_meminfo();
+	return 0;
+}
+
+int register_cxl_cfmws_ranges(struct cxl_decoder *cxld)
+{
+	struct device *dev = &cxld->dev;
+	int rc;
+
+	pr_info("CXL: register cxl cfmws ranges\n");
+
+	rc = update_or_add_cxl_meminfo(cxld->platform_res.start,
+			cxld->platform_res.end, dev->numa_node);
+	if (rc)
+		return rc;
+
+	print_cxl_meminfo();
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(register_cxl_cfmws_ranges, CXL);
+
+static int __rollback_memory_block(int fail_idx, enum CXL_MEM_MODE mode)
+{
+	int i;
+
+	for (i = 0; i < fail_idx; i++) {
+		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
+			continue;
+
+		if (__add_cxl_memory(&cxl_meminfo.blk[i], mode))
+			return -1;
+	}
+
+	return 0;
+}
+
+static int __add_all_cxl_memory(enum CXL_MEM_MODE mode,
+		enum CXL_GROUP_POLICY policy)
+{
+	int i, nid;
+
+	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
+		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
+			continue;
+
+		nid = __get_cxl_nid(policy, &cxl_meminfo.blk[i]);
+		if (nid == NUMA_NO_NODE) {
+			pr_err("CXL: no node information found [mem %#010llx-%#010llx]\n",
+					cxl_meminfo.blk[i].start, cxl_meminfo.blk[i].end);
+			return -1;
+		}
+
+		cxl_meminfo.blk[i].nid = nid;
+
+		if (__add_cxl_memory(&cxl_meminfo.blk[i], mode))
+			return -1;
+	}
+
+	return 0;
+}
+
+static int __remove_all_cxl_memory(int *fail_idx)
+{
+	int i;
+
+	if (!fail_idx)
+		return -EINVAL;
+
+	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
+		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
+			continue;
+
+		if (__remove_cxl_memory(&cxl_meminfo.blk[i])) {
+			*fail_idx = i;
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * __change_cxl_mem_mode - Change CXL.mem mode
+ * @old: old cxl_mem_mode
+ * @new: new cxl_mem_mode
+ */
+static int __change_cxl_mem_mode(enum CXL_MEM_MODE old, enum CXL_MEM_MODE new)
+{
+	int fail_idx = 0;
+
+	if (old > CXL_MEM_MODE_MAX || new > CXL_MEM_MODE_MAX)
+		return -EINVAL;
+
+	if (old != cxl_mem_mode)
+		return -EINVAL;
+
+	if (old == new) {
+		pr_info("CXL: same cxl_mem_mode, do nothing\n");
+		return 0;
+	}
+
+	mutex_lock(&cxl_meminfo_lock);
+	if (old != CXL_MEM_MODE_SOFT_RESERVED) {
+		if (__remove_all_cxl_memory(&fail_idx) < 0) {
+			pr_info("CXL: Failed to remove cxl memory, try to rollback\n");
+			if (__rollback_memory_block(fail_idx, cxl_mem_mode)) {
+				mutex_unlock(&cxl_meminfo_lock);
+				return -1;
+			}
+
+			mutex_unlock(&cxl_meminfo_lock);
+			return -1;
+		}
+	}
+
+	if (new != CXL_MEM_MODE_SOFT_RESERVED) {
+		if (__add_all_cxl_memory(new, cxl_group_policy) < 0) {
+			mutex_unlock(&cxl_meminfo_lock);
+			return -1;
+		}
+	}
+	mutex_unlock(&cxl_meminfo_lock);
+
+	pr_info("CXL: cxl_mem_mode is changed from %d to %d\n", old, new);
+	cxl_mem_mode = new;
+
+	return 0;
+}
+
+/**
+ * __change_cxl_group_policy - Change memory parititon
+ * @old: old cxl_group_policy
+ * @new: new cxl_group_policy
+ */
+static int __change_cxl_group_policy(enum CXL_GROUP_POLICY old,
+	   enum CXL_GROUP_POLICY new)
+{
+	int i, fail_idx = 0;
+
+	if (old > CXL_GROUP_POLICY_MAX || new > CXL_GROUP_POLICY_MAX)
+		return -EINVAL;
+
+	if (old != cxl_group_policy)
+		return -EINVAL;
+
+	if (old == new) {
+		pr_info("CXL: same cxl_group_policy, do nothing\n");
+		return 0;
+	}
+
+	if (dvsec_only_device) {
+		pr_warn("CXL: Warning: There's dvsec only device, do nothing\n");
+		return 0;
+	}
+
+	mutex_lock(&cxl_meminfo_lock);
+	if (new == CXL_GROUP_POLICY_NODE) {
+		for (i = 0; i < MAX_NUMNODES; i++)
+			cxl_meminfo.dev_numa_node_to_nid_map[i] = NUMA_NO_NODE;
+	}
+
+	if (__remove_all_cxl_memory(&fail_idx) < 0) {
+		pr_info("CXL: Failed to remove cxl memory, try to rollback\n");
+		if (__rollback_memory_block(fail_idx, cxl_mem_mode)) {
+			mutex_unlock(&cxl_meminfo_lock);
+			return -1;
+		}
+
+		mutex_unlock(&cxl_meminfo_lock);
+		return -1;
+	}
+
+	if (__add_all_cxl_memory(cxl_mem_mode, new) < 0) {
+		mutex_unlock(&cxl_meminfo_lock);
+		return -1;
+	}
+	mutex_unlock(&cxl_meminfo_lock);
+
+	pr_info("CXL: cxl_group_policy is changed from %d to %d\n", old, new);
+	cxl_group_policy = new;
+
+	return 0;
+}
+#endif /* CONFIG_EXMEM */
 
 /**
  * DOC: cxl pci
@@ -121,375 +643,6 @@ static unsigned short mbox_ready_timeout = 60;
 module_param(mbox_ready_timeout, ushort, 0644);
 MODULE_PARM_DESC(mbox_ready_timeout,
 		 "seconds to wait for mailbox ready / memory active status");
-
-#ifdef CONFIG_EXMEM
-enum CXL_MEM_MODE {
-	CXL_MEM_MODE_SOFT_RESERVED = 0,
-	CXL_MEM_MODE_NORMAL_ZONE,
-	CXL_MEM_MODE_EXMEM_ZONE,
-	CXL_MEM_MODE_MAX = CXL_MEM_MODE_EXMEM_ZONE,
-};
-
-static int cxl_mem_mode = CXL_MEM_MODE_SOFT_RESERVED;
-
-enum CXL_GROUP_POLICY {
-	CXL_GROUP_POLICY_ZONE = 0,
-	CXL_GROUP_POLICY_NODE,
-	CXL_GROUP_POLICY_NOOP,
-	CXL_GROUP_POLICY_MAX = CXL_GROUP_POLICY_NOOP
-};
-
-static int cxl_group_policy = CXL_GROUP_POLICY_ZONE;
-
-static struct resource *soft_reserved_res;
-static int __cxl_register_one(struct resource *res, void *data);
-
-/**
- * __remove_cxl_memory - Remove cxl.mem range from system memory
- * @nid: node id
- * @start: CXL.mem start address
- * @end: CXL.mem end address
- */
-static int __remove_cxl_memory(int nid, u64 start, u64 end)
-{
-	int rc = 0;
-
-	if (!start || !end) {
-		pr_err("CXL: no cxl.mem range is specified\n");
-		return -EINVAL;
-	}
-
-	pr_info("CXL: remove [mem %#010llx-%#010llx]\n", start, end);
-
-	rc = offline_and_remove_memory(start, end - start + 1);
-	if (rc) {
-		pr_err("CXL: failed to offline and remove memory\n");
-		return rc;
-	}
-
-	pr_info("CXL: remove subzone: nid: %d [mem %#010llx-%#010llx]\n",
-			nid, start, end);
-	rc = remove_subzone(nid, start, end);
-	if (rc) {
-		pr_err("CXL: failed to remove subzone\n");
-		return rc;
-	}
-
-	return rc;
-}
-
-static int __remove_all_cxl_memory(void)
-{
-	int i;
-
-	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
-		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
-			continue;
-
-		if (__remove_cxl_memory(cxl_meminfo.blk[i].nid,
-					cxl_meminfo.blk[i].start, cxl_meminfo.blk[i].end - 1))
-			return -1;
-	}
-
-	return 0;
-}
-
-/**
- * __add_cxl_memory - Add cxl.mem range to system memory
- * @nid: node id
- * @start: CXL.mem start address
- * @end: CXL.mem end address
- * @mode: cxl_mem_mode
- */
-static int __add_cxl_memory(int nid, u64 start, u64 end, int mode)
-{
-	int mhp_value = MHP_MERGE_RESOURCE, rc = 0;
-
-	if (!start || !end) {
-		pr_err("CXL: no cxl.mem range is specified\n");
-		return -EINVAL;
-	}
-
-	if (mode != CXL_MEM_MODE_EXMEM_ZONE && mode != CXL_MEM_MODE_NORMAL_ZONE)
-		return -EINVAL;
-
-	pr_info("CXL: add subzone: nid: %d [mem %#010llx-%#010llx]\n",
-			nid, start, end);
-	rc = add_subzone(nid, start, end);
-	if (rc) {
-		pr_err("CXL: failed to add subzone\n");
-		return rc;
-	}
-
-	pr_info("CXL: add [mem %#010llx-%#010llx] as %s zone\n", start, end,
-			mode == CXL_MEM_MODE_EXMEM_ZONE ? "ExMem" : "Normal");
-
-	if (mode == CXL_MEM_MODE_EXMEM_ZONE)
-		mhp_value |= MHP_EXMEM;
-
-	rc = add_memory(nid, start, end - start + 1, mhp_value);
-	if (rc)
-		pr_err("CXL: failed to add memory\n");
-
-	return rc;
-}
-
-static int __add_all_cxl_memory(int mode)
-{
-	int i;
-
-	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
-		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
-			continue;
-
-		if (__add_cxl_memory(cxl_meminfo.blk[i].nid,
-					cxl_meminfo.blk[i].start, cxl_meminfo.blk[i].end - 1,
-					mode))
-			return -1;
-	}
-
-	return 0;
-}
-
-/**
- * __rollback_soft_reserved_res - Rollback soft reserved resource
- */
-static int __rollback_soft_reserved_res(void)
-{
-	int ret;
-
-	if (!soft_reserved_res)
-		return -1;
-
-	pr_info("CXL: Rollback %s: [mem %#010llx-%#010llx]\n",
-			soft_reserved_res->name, soft_reserved_res->start,
-			soft_reserved_res->end);
-
-	ret = insert_resource(&iomem_resource, soft_reserved_res);
-	if (ret) {
-		pr_err("CXL: failed to insert resource\n");
-		return ret;
-	}
-
-	return 0;
-}
-
-/**
- * __change_cxl_mem_mode - Change CXL.mem mode
- * @old: old cxl mem mode
- * @new: new cxl mem mode
- */
-static int __change_cxl_mem_mode(int old, int new)
-{
-	int ret = 0;
-
-	if (old != cxl_mem_mode)
-		return -1;
-
-	if (old == new) {
-		pr_info("CXL: same cxl mem mode\n");
-		return 0;
-	}
-
-	if (old > CXL_MEM_MODE_MAX || new > CXL_MEM_MODE_MAX)
-		return -1;
-
-	if (old == CXL_MEM_MODE_SOFT_RESERVED) {
-		ret = walk_iomem_res_desc(IORES_DESC_SOFT_RESERVED,
-				IORESOURCE_MEM, 0, -1, &new, __cxl_register_one);
-		if (ret)
-			return -1;
-	} else {
-		/* First, remove CXL.mem region from system memory */
-		if (__remove_all_cxl_memory() < 0)
-			return -1;
-
-		if (new == CXL_MEM_MODE_SOFT_RESERVED)
-			ret = __rollback_soft_reserved_res();
-		else
-			ret = __add_all_cxl_memory(new);
-
-		if (ret)
-			return -1;
-	}
-
-	pr_info("CXL: cxl_mem_mode change from %d to %d\n", old, new);
-	cxl_mem_mode = new;
-
-	return 0;
-}
-
-static int __get_cxl_nid(enum CXL_GROUP_POLICY policy, u64 start)
-{
-	if (policy == CXL_GROUP_POLICY_ZONE)
-		return 0;
-	else if (policy == CXL_GROUP_POLICY_NODE) {
-		int i;
-		for (i = 0; i < cxl_meminfo.nr_blks; i++) {
-			if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
-				continue;
-
-			return phys_to_target_node(cxl_meminfo.blk[i].start);
-		}
-	} else if (policy == CXL_GROUP_POLICY_NOOP)
-		return phys_to_target_node(start);
-
-	return NUMA_NO_NODE;
-}
-
-static int __change_cxl_group_policy(enum CXL_GROUP_POLICY old,
-	   enum CXL_GROUP_POLICY new)
-{
-	int i, nid;
-
-	if (old != cxl_group_policy)
-		return -1;
-
-	if (old == new) {
-		pr_info("CXL: same cxl group policy\n");
-		return 0;
-	}
-
-	if (old > CXL_GROUP_POLICY_MAX || new > CXL_GROUP_POLICY_MAX)
-		return -1;
-
-	if (__remove_all_cxl_memory() < 0)
-		return -1;
-
-	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
-		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
-			continue;
-
-		nid = __get_cxl_nid(new, cxl_meminfo.blk[i].start);
-		if (nid < 0) {
-			pr_err("CXL: no node info for %#010llx\n",
-					cxl_meminfo.blk[i].start);
-			return -1;
-		}
-
-		cxl_meminfo.blk[i].nid = nid;
-
-		pr_info("CXL: nid: %d [mem %#010llx-%#010llx]\n",
-				cxl_meminfo.blk[i].nid, cxl_meminfo.blk[i].start,
-				cxl_meminfo.blk[i].end - 1);
-	}
-
-	if (__add_all_cxl_memory(cxl_mem_mode) < 0)
-		return -1;
-
-	pr_info("CXL: cxl_group_policy change from %d to %d\n", old, new);
-	cxl_group_policy = new;
-
-	return 0;
-}
-
-/**
- * cxl_mem_mode_show - Get cxl_mem_mode
- */
-static ssize_t cxl_mem_mode_show(struct kobject *kobj, struct kobj_attribute *attr,
-		char *buf)
-{
-	return sprintf(buf, "%d\n", cxl_mem_mode);
-}
-
-/**
- * cxl_mem_mode_store - Set cxl_mem_mode
- */
-static ssize_t cxl_mem_mode_store(struct kobject *kobj, struct kobj_attribute *attr,
-		const char *buf, size_t count)
-{
-	int ret, tmp;
-	int old = cxl_mem_mode;
-
-	ret = kstrtoint(buf, 10, &tmp);
-	if (ret < 0) {
-		pr_err("CXL: bad cxl mem mode\n");
-		return count;
-	}
-
-	if (tmp > CXL_MEM_MODE_MAX) {
-		pr_err("CXL: bad cxl mem mode\n");
-		return count;
-	}
-
-	if (tmp == old)
-		return count;
-
-	if (tmp != CXL_MEM_MODE_EXMEM_ZONE) {
-		pr_info("CXL: cxl_mem_mode is not ExMem zone, so change group policy to zone\n");
-		if (__change_cxl_group_policy(cxl_group_policy, CXL_GROUP_POLICY_ZONE))
-			return count;
-	}
-
-	if (__change_cxl_mem_mode(old, tmp) < 0) {
-		pr_err("CXL: failed to change cxl mem mode\n");
-		return count;
-	}
-
-	return count;
-}
-
-static struct kobj_attribute cxl_mem_mode_attribute =
-	__ATTR(cxl_mem_mode, 0664, cxl_mem_mode_show, cxl_mem_mode_store);
-
-/**
- * cxl_group_policy_show - Get cxl_group_policy
- */
-static ssize_t cxl_group_policy_show(struct kobject *kobj,
-		struct kobj_attribute *attr, char *buf)
-{
-	if (cxl_group_policy == CXL_GROUP_POLICY_ZONE)
-		return sprintf(buf, "zone\n");
-	else if (cxl_group_policy == CXL_GROUP_POLICY_NODE)
-		return sprintf(buf, "node\n");
-	return sprintf(buf, "noop\n");
-}
-
-/**
- * cxl_group_policy_store - Set cxl_group_policy
- */
-static ssize_t cxl_group_policy_store(struct kobject *kobj,
-		struct kobj_attribute *attr, const char *buf, size_t count)
-{
-	enum CXL_GROUP_POLICY tmp;
-
-	if (cxl_mem_mode != CXL_MEM_MODE_EXMEM_ZONE) {
-		pr_info("CXL: cxl_mem_mode is not 2.");
-		return count;
-	}
-
-	if (strncmp(buf, "zone", 4) == 0)
-		tmp = CXL_GROUP_POLICY_ZONE;
-	else if (strncmp(buf, "node", 4) == 0)
-		tmp = CXL_GROUP_POLICY_NODE;
-	else if (strncmp(buf, "noop", 4) == 0)
-		tmp = CXL_GROUP_POLICY_NOOP;
-	else
-		return -EINVAL;
-
-	if (__change_cxl_group_policy(cxl_group_policy, tmp) < 0) {
-		pr_err("CXL: failed to change cxl group policy\n");
-		return count;
-	}
-
-	return count;
-}
-
-static struct kobj_attribute cxl_group_policy_attribute =
-	__ATTR(cxl_group_policy, 0664, cxl_group_policy_show, cxl_group_policy_store);
-
-static struct attribute *attrs[] = {
-	&cxl_mem_mode_attribute.attr,
-	&cxl_group_policy_attribute.attr,
-	NULL,
-};
-
-static struct attribute_group attr_group = {
-	.attrs = attrs,
-};
-
-static struct kobject *cxl_kobj;
-#endif /* CONFIG_EXMEM */
 
 static int cxl_pci_mbox_wait_for_doorbell(struct cxl_dev_state *cxlds)
 {
@@ -984,81 +1137,6 @@ static int cxl_dvsec_ranges(struct cxl_dev_state *cxlds)
 	return 0;
 }
 
-#ifdef CONFIG_EXMEM
-/**
- * __cxl_register_one - Change soft reserved memory region to usable
- * @res: soft reserved memory region
- * @data: cxl mem mode
- */
-static int __cxl_register_one(struct resource *res, void *data)
-{
-	int node;
-	struct resource **p, *target = NULL;
-	int mode, i;
-
-	/*
-	 * If the resource is not a top-level resource it was already
-	 * assigned to a device by the HMAT parsing.
-	 */
-	if (res->parent != &iomem_resource) {
-		pr_info("CXL: skip %pr, already claimed\n", res);
-		return 0;
-	}
-
-	if (!data)
-		return -1;
-
-	mode = (int)(*(int *)data);
-
-	if (mode < 0 || mode > CXL_MEM_MODE_MAX)
-		return -1;
-
-	pr_info("CXL: soft reserved: [mem %#010llx-%#010llx]\n",
-			res->start, res->end);
-
-	for (i = 0; i < cxl_meminfo.nr_blks; i++) {
-		if (cxl_meminfo.blk[i].nid == NUMA_NO_NODE)
-			continue;
-
-		node = __get_cxl_nid(cxl_group_policy, cxl_meminfo.blk[i].start);
-		if (node < 0) {
-			pr_err("CXL: no node info for %#010llx\n",
-					cxl_meminfo.blk[i].start);
-			return -1;
-		}
-
-		cxl_meminfo.blk[i].nid = node;
-
-		pr_info("CXL: nid: %d [mem %#010llx-%#010llx]\n",
-				node, cxl_meminfo.blk[i].start, cxl_meminfo.blk[i].end - 1);
-	}
-
-	p = &res->parent->child;
-	for (;;) {
-		struct resource *tmp = *p;
-		if (!tmp)
-			break;
-		if (tmp->start == res->start && tmp->end == res->end) {
-			target = tmp;
-			break;
-		}
-		p = &tmp->sibling;
-	}
-	if (target) {
-		soft_reserved_res = target;
-		if (release_resource(target)) {
-			pr_err("CXL: failed to release resource\n");
-			return -1;
-		}
-	}
-
-	if (__add_all_cxl_memory(mode))
-		return -1;
-
-	return 0;
-}
-#endif /* CONFIG_EXMEM */
-
 static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct cxl_register_map map;
@@ -1089,6 +1167,19 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 			 "Device DVSEC not present, skip CXL.mem init\n");
 
 	cxlds->wait_media_ready = wait_for_media_ready;
+
+#ifdef CONFIG_EXMEM
+	rc = cxl_dvsec_ranges(cxlds);
+	if (rc)
+		dev_warn(&pdev->dev,
+			 "Failed to get DVSEC range information (%d)\n", rc);
+
+	if (!rc) {
+		rc = register_cxl_dvsec_ranges(cxlds);
+		if (rc)
+			pr_err("Failed to register cxl dvsec ranges (%d)\n", rc);
+	}
+#endif
 
 	rc = cxl_setup_regs(pdev, CXL_REGLOC_RBI_MEMDEV, &map);
 	if (rc)
@@ -1125,10 +1216,12 @@ static int cxl_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (rc)
 		return rc;
 
+#ifndef CONFIG_EXMEM
 	rc = cxl_dvsec_ranges(cxlds);
 	if (rc)
 		dev_warn(&pdev->dev,
 			 "Failed to get DVSEC range information (%d)\n", rc);
+#endif
 
 	cxlmd = devm_cxl_add_memdev(cxlds);
 	if (IS_ERR(cxlmd))
@@ -1157,33 +1250,158 @@ static struct pci_driver cxl_pci_driver = {
 };
 
 #ifdef CONFIG_EXMEM
+static ssize_t cxl_mem_mode_show(struct kobject *kobj, struct kobj_attribute *attr,
+		char *buf)
+{
+	return sprintf(buf, "%d\n", cxl_mem_mode);
+}
+
+static ssize_t cxl_mem_mode_store(struct kobject *kobj, struct kobj_attribute *attr,
+		const char *buf, size_t count)
+{
+	int ret, tmp;
+	enum CXL_MEM_MODE old = cxl_mem_mode;
+
+	ret = kstrtoint(buf, 10, &tmp);
+	if (ret < 0) {
+		pr_err("CXL: bad cxl_mem_mode\n");
+		return count;
+	}
+
+	if (tmp > CXL_MEM_MODE_MAX) {
+		pr_err("CXL: bad cxl_mem_mode\n");
+		return count;
+	}
+
+	if (tmp == old) {
+		pr_info("CXL: same cxl_mem_mode, do nothing\n");
+		return count;
+	}
+
+	if (tmp != CXL_MEM_MODE_ZONE_EXMEM) {
+		pr_info("CXL: cxl_mem_mode is not ExMem zone, "
+				"so change cxl_group_policy to zone\n");
+		if (__change_cxl_group_policy(cxl_group_policy, CXL_GROUP_POLICY_ZONE))
+			return count;
+	}
+
+	if (__change_cxl_mem_mode(old, tmp) < 0) {
+		pr_err("CXL: failed to change cxl_mem_mode\n");
+		return count;
+	}
+
+	return count;
+}
+
+static struct kobj_attribute cxl_mem_mode_attribute =
+	__ATTR(cxl_mem_mode, 0664, cxl_mem_mode_show, cxl_mem_mode_store);
+
+static ssize_t cxl_group_policy_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	if (cxl_group_policy == CXL_GROUP_POLICY_ZONE)
+		return sprintf(buf, "zone\n");
+	else if (cxl_group_policy == CXL_GROUP_POLICY_NODE)
+		return sprintf(buf, "node\n");
+	return sprintf(buf, "noop\n");
+}
+
+static ssize_t cxl_group_policy_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	enum CXL_GROUP_POLICY tmp;
+
+	if (cxl_mem_mode != CXL_MEM_MODE_ZONE_EXMEM) {
+		pr_info("CXL: cxl_group_policy can be changed "
+				"only if cxl_mem_mode is 2\n");
+		return count;
+	}
+
+	if (strncmp(buf, "zone", 4) == 0)
+		tmp = CXL_GROUP_POLICY_ZONE;
+	else if (strncmp(buf, "node", 4) == 0)
+		tmp = CXL_GROUP_POLICY_NODE;
+	else if (strncmp(buf, "noop", 4) == 0)
+		tmp = CXL_GROUP_POLICY_NOOP;
+	else
+		return -EINVAL;
+
+	if (__change_cxl_group_policy(cxl_group_policy, tmp) < 0) {
+		pr_err("CXL: failed to change cxl_group_policy\n");
+		return count;
+	}
+
+	return count;
+}
+
+static struct kobj_attribute cxl_group_policy_attribute =
+	__ATTR(cxl_group_policy, 0664, cxl_group_policy_show, cxl_group_policy_store);
+
+static struct attribute *attrs[] = {
+	&cxl_mem_mode_attribute.attr,
+	&cxl_group_policy_attribute.attr,
+	NULL,
+};
+
+static struct attribute_group attr_group = {
+	.attrs = attrs,
+};
+
+static struct kobject *cxl_kobj;
+
+static int exmem_init(void)
+{
+	int rc;
+
+	rc = get_cxl_meminfo();
+	if (rc) {
+		pr_err("Failed to get cxl meminfo: %d\n", rc);
+		return rc;
+	}
+
+	cxl_kobj = kobject_create_and_add("cxl", kernel_kobj);
+	if (!cxl_kobj)
+		return -ENOMEM;
+
+	rc = sysfs_create_group(cxl_kobj, &attr_group);
+	if (rc) {
+		kobject_put(cxl_kobj);
+		return rc;
+	}
+
+	rc = __change_cxl_mem_mode(cxl_mem_mode, CXL_MEM_MODE_ZONE_EXMEM);
+	if (rc) {
+		sysfs_remove_group(cxl_kobj, &attr_group);
+		kobject_put(cxl_kobj);
+		return rc;
+	}
+
+	return 0;
+}
+
+static void exmem_exit(void)
+{
+	if (cxl_mem_mode != CXL_MEM_MODE_SOFT_RESERVED)
+		__change_cxl_mem_mode(cxl_mem_mode, CXL_MEM_MODE_SOFT_RESERVED);
+
+	if (cxl_kobj) {
+		sysfs_remove_group(cxl_kobj, &attr_group);
+		kobject_put(cxl_kobj);
+	}
+}
+
 static __init int exmem_cxl_pci_init(void)
 {
 	int rc;
 
-	rc = pci_register_driver(&cxl_pci_driver);
+	rc = exmem_init();
 	if (rc)
 		return rc;
 
-	numa_get_reserved_meminfo(&cxl_meminfo);
-	check_reserved_meminfo(&cxl_meminfo);
-	print_numa_reserved_meminfo(&cxl_meminfo);
-
-	cxl_kobj = kobject_create_and_add("cxl", kernel_kobj);
-	if (!cxl_kobj)
-		return 0;
-
-	/* Create the files associated with this kobject */
-	rc = sysfs_create_group(cxl_kobj, &attr_group);
+	rc = pci_register_driver(&cxl_pci_driver);
 	if (rc) {
-		kobject_put(cxl_kobj);
-		return 0;
-	}
-
-	/* Activate soft reserved region as a CXL zone at init time */
-	if (__change_cxl_mem_mode(cxl_mem_mode, CXL_MEM_MODE_EXMEM_ZONE) < 0) {
-		kobject_put(cxl_kobj);
-		return 0;
+		exmem_exit();
+		return rc;
 	}
 
 	return 0;
@@ -1191,9 +1409,8 @@ static __init int exmem_cxl_pci_init(void)
 
 static __exit void exmem_cxl_pci_exit(void)
 {
-	__change_cxl_mem_mode(cxl_mem_mode, CXL_MEM_MODE_SOFT_RESERVED);
-	kobject_put(cxl_kobj);
 	pci_unregister_driver(&cxl_pci_driver);
+	exmem_exit();
 }
 #endif
 

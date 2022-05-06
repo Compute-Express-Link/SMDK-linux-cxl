@@ -64,14 +64,14 @@ struct vm_area_struct;
 #define ___GFP_SKIP_KASAN_POISON	0
 #endif
 #ifdef CONFIG_LOCKDEP
-#define ___GFP_NOLOCKDEP        0x8000000u
+#define ___GFP_NOLOCKDEP	0x8000000u
 #ifdef CONFIG_EXMEM
-#define ___GFP_EXMEM            0x10000000u
+#define ___GFP_EXMEM		0x10000000u
 #endif
 #else
-#define ___GFP_NOLOCKDEP        0
+#define ___GFP_NOLOCKDEP	0
 #ifdef CONFIG_EXMEM
-#define ___GFP_EXMEM            0x8000000u
+#define ___GFP_EXMEM		0x8000000u
 #endif
 #endif
 /* If the above are modified, __GFP_BITS_SHIFT may need updating */

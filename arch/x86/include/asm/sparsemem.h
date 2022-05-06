@@ -35,7 +35,13 @@ extern int phys_to_target_node(phys_addr_t start);
 #define phys_to_target_node phys_to_target_node
 extern int memory_add_physaddr_to_nid(u64 start);
 #define memory_add_physaddr_to_nid memory_add_physaddr_to_nid
-#endif
+#ifdef CONFIG_EXMEM
+extern int numa_get_reserved_meminfo_cnt(void);
+#define numa_get_reserved_meminfo_cnt numa_get_reserved_meminfo_cnt
+extern int numa_get_reserved_meminfo(int idx, int *nid, u64 *start, u64 *end);
+#define numa_get_reserved_meminfo numa_get_reserved_meminfo
+#endif /* CONFIG_EXMEM */
+#endif /* CONFIG_NUMA_KEEP_MEMINFO */
 #endif /* __ASSEMBLY__ */
 
 #endif /* _ASM_X86_SPARSEMEM_H */

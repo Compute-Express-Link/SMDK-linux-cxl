@@ -31,24 +31,6 @@ static struct numa_meminfo numa_reserved_meminfo __initdata_or_meminfo;
 static int numa_distance_cnt;
 static u8 *numa_distance;
 
-#ifdef CONFIG_EXMEM
-void numa_get_reserved_meminfo(struct numa_meminfo *mi)
-{
-	int i;
-
-	if (!mi)
-		return;
-
-	mi->nr_blks = numa_reserved_meminfo.nr_blks;
-	for (i = 0; i < numa_reserved_meminfo.nr_blks; i++) {
-		mi->blk[i].start = numa_reserved_meminfo.blk[i].start;
-		mi->blk[i].end= numa_reserved_meminfo.blk[i].end;
-		mi->blk[i].nid = numa_reserved_meminfo.blk[i].nid;
-	}
-}
-EXPORT_SYMBOL_GPL(numa_get_reserved_meminfo);
-#endif
-
 static __init int numa_setup(char *opt)
 {
 	if (!opt)
@@ -979,4 +961,32 @@ int memory_add_physaddr_to_nid(u64 start)
 	return nid;
 }
 EXPORT_SYMBOL_GPL(memory_add_physaddr_to_nid);
+
+#ifdef CONFIG_EXMEM
+int numa_get_reserved_meminfo_cnt(void)
+{
+	return numa_reserved_meminfo.nr_blks;
+}
+EXPORT_SYMBOL_GPL(numa_get_reserved_meminfo_cnt);
+
+int numa_get_reserved_meminfo(int idx, int *nid, u64 *start, u64 *end)
+{
+	if (idx < 0 || idx >= numa_reserved_meminfo.nr_blks) {
+		pr_err("Invalid memblk index: %d\n", idx);
+		return -1;
+	}
+
+	if (!nid || !start || !end) {
+		pr_err("Invalid parameter: NULL\n");
+		return -1;
+	}
+
+	*nid = numa_reserved_meminfo.blk[idx].nid;
+	*start = numa_reserved_meminfo.blk[idx].start;
+	*end = numa_reserved_meminfo.blk[idx].end;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(numa_get_reserved_meminfo);
+#endif /* CONFIG_EXMEM */
 #endif

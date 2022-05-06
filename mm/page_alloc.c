@@ -963,6 +963,73 @@ compaction_capture(struct capture_control *capc, struct page *page,
 		index <= zone->nr_subzones;	\
 		subzone_idx = get_next_subzone_id(zone, ++index))
 
+static void free_subzone_mem(struct zone *zone)
+{
+	int i;
+
+	if (!zone || !zone_is_zone_exmem(zone)) {
+		pr_err("Invalid zone: null or not ExMem\n");
+		return;
+	}
+
+	for (i = 0; i < MAX_NR_SUBZONES; i++) {
+		if (zone->free_area_subzone[i]) {
+			kfree(zone->free_area_subzone[i]);
+			zone->free_area_subzone[i] = NULL;
+		}
+	}
+
+	if (zone->subzones) {
+		kfree(zone->subzones);
+		zone->subzones = NULL;
+	}
+
+	if (zone->subzonelist) {
+		kfree(zone->subzonelist);
+		zone->subzonelist = NULL;
+	}
+}
+
+static int alloc_subzone_mem(struct zone *zone)
+{
+	int i;
+
+	if (!zone || !zone_is_zone_exmem(zone)) {
+		pr_err("Invalid zone: null or not ExMem\n");
+		return -EINVAL;
+	}
+
+	for (i = 0; i < MAX_NR_SUBZONES; i++) {
+		if (!zone->free_area_subzone[i]) {
+			zone->free_area_subzone[i] =
+				kzalloc(sizeof(struct free_area) * MAX_ORDER, GFP_ATOMIC);
+			if (!zone->free_area_subzone[i])
+				goto alloc_failed;
+		}
+	}
+
+	if (!zone->subzones) {
+		zone->subzones = kzalloc(sizeof(struct subzone) * MAX_NR_SUBZONES,
+				GFP_ATOMIC);
+		if (!zone->subzones)
+			goto alloc_failed;
+	}
+
+	if (!zone->subzonelist) {
+		zone->subzonelist =
+			kzalloc(sizeof(struct subzoneref) * (MAX_NR_SUBZONES + 1),
+					GFP_ATOMIC);
+		if (!zone->subzonelist)
+			goto alloc_failed;
+	}
+
+	return 0;
+
+alloc_failed:
+	free_subzone_mem(zone);
+	return -ENOMEM;
+}
+
 /**
  * Returns the subzone_idx of the subzoneref that has passed the offset from
  * the most recent page-allocated subzonelist index.
@@ -1066,6 +1133,9 @@ int remove_subzone(int nid, u64 start, u64 end)
 		return -1;
 	}
 
+	if (zone->nr_subzones == 0)
+		free_subzone_mem(zone);
+
 	spin_unlock_irqrestore(&zone->lock, flags);
 	return 0;
 }
@@ -1081,7 +1151,7 @@ int add_subzone(int nid, u64 start, u64 end)
 		return -1;
 
 	if (!node_online(nid)) {
-		pr_info("subzone: node %d is offline\n", nid);
+		pr_info("subzone: node %d is offline, try online node.\n", nid);
 		if (try_online_node(nid) < 0) {
 			pr_err("subzone: failed to online node %d\n", nid);
 			return -1;
@@ -1097,9 +1167,17 @@ int add_subzone(int nid, u64 start, u64 end)
 	spin_lock_irqsave(&zone->lock, flags);
 
 	if (zone->nr_subzones >= MAX_NR_SUBZONES) {
-		pr_err("subzone is full\n");
 		spin_unlock_irqrestore(&zone->lock, flags);
+		pr_err("subzone is full\n");
 		return -1;
+	}
+
+	if (zone->nr_subzones == 0) {
+		if (alloc_subzone_mem(zone)) {
+			spin_unlock_irqrestore(&zone->lock, flags);
+			pr_err("Failed to alloc struct subzone.\n");
+			return -ENOMEM;
+		}
 	}
 
 	/* Find empty slot */
@@ -1122,9 +1200,6 @@ int add_subzone(int nid, u64 start, u64 end)
 	zone->nr_subzones++;
 
 	pr_info("subzone count: %d\n", zone->nr_subzones);
-	pr_info("subzone info: #%d: [%#010lx-%#010lx]\n", subzone_id,
-			zone->subzones[subzone_id].start_pfn,
-			zone->subzones[subzone_id].end_pfn);
 
 	if (build_subzonelist(zone)) {
 		spin_unlock_irqrestore(&zone->lock, flags);
