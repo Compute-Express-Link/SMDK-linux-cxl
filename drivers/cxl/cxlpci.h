@@ -81,4 +81,7 @@ int devm_cxl_port_enumerate_dports(struct cxl_port *port);
 #ifdef CONFIG_EXMEM
 int register_cxl_cfmws_ranges(struct cxl_decoder *cxld);
 #endif
+
+struct cxl_dev_state;
+int cxl_hdm_decode_init(struct cxl_dev_state *cxlds, struct cxl_hdm *cxlhdm);
 #endif /* __CXL_PCI_H__ */
