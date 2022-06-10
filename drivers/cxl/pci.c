@@ -305,7 +305,7 @@ static int get_cxl_meminfo(void)
 		}
 
 		mutex_lock(&cxl_meminfo_lock);
-		cmb = find_cxl_meminfo(start, end);
+		cmb = find_cxl_meminfo(start, end - 1);
 		if (cmb) {
 			pr_warn("CXL: same info, [mem %#010llx-%#010llx]\n", start, end);
 			mutex_unlock(&cxl_meminfo_lock);
@@ -1320,6 +1320,7 @@ static int exmem_init(void)
 	rc = sysfs_create_group(cxl_kobj, &attr_group);
 	if (rc) {
 		kobject_put(cxl_kobj);
+		cxl_kobj = NULL;
 		return rc;
 	}
 
@@ -1327,6 +1328,7 @@ static int exmem_init(void)
 	if (rc) {
 		sysfs_remove_group(cxl_kobj, &attr_group);
 		kobject_put(cxl_kobj);
+		cxl_kobj = NULL;
 		return rc;
 	}
 
@@ -1341,6 +1343,7 @@ static void exmem_exit(void)
 	if (cxl_kobj) {
 		sysfs_remove_group(cxl_kobj, &attr_group);
 		kobject_put(cxl_kobj);
+		cxl_kobj = NULL;
 	}
 }
 
@@ -1350,7 +1353,7 @@ static __init int exmem_cxl_pci_init(void)
 
 	rc = exmem_init();
 	if (rc)
-		return rc;
+		pr_warn("ExMem init failed (%d)\n", rc);
 
 	rc = pci_register_driver(&cxl_pci_driver);
 	if (rc) {
